@@ -200,19 +200,35 @@ const SCENARIOS = [
 ];
 
 const ENVIRONMENTS = ["UAT", "PRD", "SIT", "DEV"];
-const SIEBEL_ENDPOINTS = {
-  UAT: "https://10.59.17.88/siebel/app/eai_anon/enu?SWEExtSource=AnonWebService&SWEExtCmd=Execute",
-  SIT: "https://10.59.17.86/siebel/app/eai_anon/enu?SWEExtSource=AnonWebService&SWEExtCmd=Execute",
-  PRD: "https://10.58.16.205/siebel/app/eai_anon/enu?SWEExtSource=AnonWebService&SWEExtCmd=Execute",
-  DEV: "https://10.59.17.86/siebel/app/eai_anon/enu?SWEExtSource=AnonWebService&SWEExtCmd=Execute",
+const ENV_CONFIG = {
+  DEV: {
+    uriEnvCode: "TST",
+    siebelEndpoint: "https://10.59.7.118:9004/siebel/app/eai_anon/enu?SWEExtSource=AnonWebService&SWEExtCmd=Execute",
+    appLayerBaseUrl: "http://10.59.7.78:8005",
+  },
+  SIT: {
+    uriEnvCode: "UAT",
+    siebelEndpoint: "https://10.59.17.86/siebel/app/eai_anon/enu?SWEExtSource=AnonWebService&SWEExtCmd=Execute",
+    appLayerBaseUrl: "http://10.59.17.81",
+  },
+  UAT: {
+    uriEnvCode: "UAT",
+    siebelEndpoint: "https://10.59.17.88/siebel/app/eai_anon/enu?SWEExtSource=AnonWebService&SWEExtCmd=Execute",
+    appLayerBaseUrl: "http://10.59.17.65",
+  },
+  PRD: {
+    uriEnvCode: "PRD",
+    siebelEndpoint: "https://10.58.16.205/siebel/app/eai_anon/enu?SWEExtSource=AnonWebService&SWEExtCmd=Execute",
+    appLayerBaseUrl: "http://10.58.16.193",
+  },
 };
-const AUTH_POLICIES = [
-  "Usr(portal_user)|Usr(dmz_user,mobility_user)",
-  "Usr(dmz_user,portal_user)",
-  "Usr(portal_user)",
-  "Usr(dmz_user)",
-  "Custom",
-];
+const SIEBEL_ENDPOINTS = Object.fromEntries(Object.entries(ENV_CONFIG).map(([k, v]) => [k, v.siebelEndpoint]));
+const TIMEOUT_CONFIG = {
+  appSiebelBS: { connectionTimeout: 20, readTimeout: 30 },
+  dmzBS: { connectionTimeout: 10, readTimeout: 30 },
+  retryCount: 0,
+  retryInterval: 30,
+};
 
 // ─── DEFAULT OPERATION FACTORY ───────────────────────────────
 const createDefaultOp = (opName = "") => ({
@@ -1975,8 +1991,8 @@ function generateBusinessService(config) {
         <tran:provider-specific xsi:type="http:HttpEndPointConfiguration">
             <http:outbound-properties>
                 <http:request-method>POST</http:request-method>
-                <http:timeout>60</http:timeout>
-                <http:connection-timeout>20</http:connection-timeout>
+                <http:timeout>${TIMEOUT_CONFIG.appSiebelBS.readTimeout}</http:timeout>
+                <http:connection-timeout>${TIMEOUT_CONFIG.appSiebelBS.connectionTimeout}</http:connection-timeout>
                 <http:follow-redirects>false</http:follow-redirects>
                 <http:chunked-streaming-mode>false</http:chunked-streaming-mode>
                 <http:session-sctikiness enabled="false" session-id-name="JSESSIONID"/>
@@ -2097,7 +2113,7 @@ function generateDmzProxyService(config) {
         <tran:provider-id>http</tran:provider-id>
         <tran:inbound>true</tran:inbound>
         <tran:URI>
-            <env:value>/secured/${psName}</env:value>
+            <env:value>/secured/${serviceName}Rest/${config.operationName || serviceName}</env:value>
         </tran:URI>
         <tran:inbound-properties/>
         <tran:provider-specific xsi:type="http:HttpEndPointConfiguration" xmlns:http="http://www.bea.com/wli/sb/transports/http">
@@ -2151,8 +2167,8 @@ function generateDmzBusinessService(config) {
         </tran:outbound-properties>
         <tran:provider-specific xsi:type="http:HttpEndPointConfiguration">
             <http:outbound-properties>
-                <http:timeout>30</http:timeout>
-                <http:connection-timeout>5</http:connection-timeout>
+                <http:timeout>${TIMEOUT_CONFIG.dmzBS.readTimeout}</http:timeout>
+                <http:connection-timeout>${TIMEOUT_CONFIG.dmzBS.connectionTimeout}</http:connection-timeout>
                 <http:outbound-authentication xsi:type="http:HttpBasicAuthenticationType"/>
                 <http:service-account ref="CommonSBProject/serviceaccount/SecurityServiceAccount"/>
                 <http:follow-redirects>false</http:follow-redirects>
@@ -4909,7 +4925,7 @@ export default function OSBServiceGenerator() {
   const [portTypeName, setPortTypeName] = useState("");
   const [environment, setEnvironment] = useState("UAT");
   const [uriPath, setUriPath] = useState("");
-  const [authPolicy, setAuthPolicy] = useState(AUTH_POLICIES[0]);
+  const [authUsers, setAuthUsers] = useState(["dmz_user"]);
   const [customAuth, setCustomAuth] = useState("");
   const [generatedFiles, setGeneratedFiles] = useState([]);
   const [activeFile, setActiveFile] = useState("");
@@ -5022,13 +5038,13 @@ export default function OSBServiceGenerator() {
       if (!manualEdits.proxyName) setProxyName(`${serviceName}PS`);
       if (!manualEdits.bindingName) setBindingName(`${serviceName}Binding`);
       if (!manualEdits.portTypeName) setPortTypeName(`${serviceName}Port`);
-      if (!manualEdits.uriPath) setUriPath(`/CRMNex${environment}Ext/${serviceName}`);
+      if (!manualEdits.uriPath) setUriPath(`/CRMNex${(ENV_CONFIG[environment] || ENV_CONFIG.UAT).uriEnvCode}Ext/${serviceName}`);
       if (!manualEdits.dmzDvmKey) {
         const dvmSuffix = dmzChannels.mobility ? "Mobility" : dmzChannels.b2b ? "B2B" : dmzChannels.ssf ? "SSF" : "Mobility";
         setDmzDvmKey(`${serviceName}_${dvmSuffix}`);
       }
       if (!manualEdits.dmzNxsdName) setDmzNxsdName(`nxsd_${serviceName}`);
-      if (!manualEdits.dmzAppLayerUrl) setDmzAppLayerUrl(`http://10.59.17.65/CRMNex${environment}Ext/${serviceName}`);
+      if (!manualEdits.dmzAppLayerUrl) { const ec = ENV_CONFIG[environment] || ENV_CONFIG.UAT; setDmzAppLayerUrl(`${ec.appLayerBaseUrl}/CRMNex${ec.uriEnvCode}Ext/${serviceName}`); }
       // Auto-derive first operation's names from serviceName
       setOperations(prev => prev.map((o, i) => {
         if (i !== 0) return o;
@@ -5081,7 +5097,7 @@ export default function OSBServiceGenerator() {
 
   useEffect(() => {
     if (serviceName && !manualEdits.uriPath) {
-      setUriPath(`/CRMNex${environment}Ext/${serviceName}`);
+      setUriPath(`/CRMNex${(ENV_CONFIG[environment] || ENV_CONFIG.UAT).uriEnvCode}Ext/${serviceName}`);
     }
     // Update siebelEndpointUrl for ALL operations when environment changes
     if (SIEBEL_ENDPOINTS[environment]) {
@@ -5271,7 +5287,7 @@ export default function OSBServiceGenerator() {
     const baseConfig = {
       projectName, serviceName, proxyName: effectiveProxyName,
       bindingName: effectiveBindingName, portTypeName: effectivePortTypeName, namespace,
-      uriPath, authPolicy: authPolicy === "Custom" ? customAuth : authPolicy,
+      uriPath, authPolicy: "Usr(" + authUsers.join(",") + ")",
       pipelineName: effectivePipelineName,
     };
 
@@ -5355,7 +5371,8 @@ export default function OSBServiceGenerator() {
         requestFields: firstOp.requestFields, responseFields: firstOp.responseFields,
       };
       const dvmFallbackSuffix = dmzChannels.mobility ? "Mobility" : dmzChannels.b2b ? "B2B" : dmzChannels.ssf ? "SSF" : "Mobility";
-      const dmzConfig = { ...dmzFirstOpConfig, dmzDvmKey: dmzDvmKey || `${serviceName}_${dvmFallbackSuffix}`, dmzAppLayerUrl: dmzAppLayerUrl || `http://10.59.17.65/CRMNex${environment}Ext/${serviceName}`, dmzNxsdName: dmzNxsdName || `nxsd_${serviceName}`, dmzChannels };
+      const envCfg = ENV_CONFIG[environment] || ENV_CONFIG.UAT;
+      const dmzConfig = { ...dmzFirstOpConfig, dmzDvmKey: dmzDvmKey || `${serviceName}_${dvmFallbackSuffix}`, dmzAppLayerUrl: dmzAppLayerUrl || `${envCfg.appLayerBaseUrl}/CRMNex${envCfg.uriEnvCode}Ext/${serviceName}`, dmzNxsdName: dmzNxsdName || `nxsd_${serviceName}`, dmzChannels };
       files.push({ path: `${p}/_projectdata.LocationData`, content: LOCATION_DATA, layer: "dmz" });
       ["schema", "wsdl", "proxy", "Resources", "business"].forEach(folder => {
         files.push({ path: `${p}/${folder}/_folderdata.LocationData`, content: LOCATION_DATA, layer: "dmz" });
@@ -5389,23 +5406,27 @@ export default function OSBServiceGenerator() {
 
     setActiveFile(files.find(f => f.path.includes("Pipeline") || f.path.includes("BusinessService"))?.path || files[0].path);
     setStep(4);
-  }, [projectName, serviceName, proxyName, operationName, bindingName, portTypeName, namespace, requestElement, responseElement, uriPath, authPolicy, customAuth, requestFields, responseFields, serviceType, odsServiceId, siebelWsdlRef, siebelWsdlRaw, siebelInputElement, siebelOutputElement, siebelPortName, siebelEndpointUrl, dmzEnabled, dmzChannels, dmzDvmKey, dmzAppLayerUrl, dmzNxsdName, operations]);
+  }, [projectName, serviceName, proxyName, operationName, bindingName, portTypeName, namespace, requestElement, responseElement, uriPath, authUsers, requestFields, responseFields, serviceType, odsServiceId, siebelWsdlRef, siebelWsdlRaw, siebelInputElement, siebelOutputElement, siebelPortName, siebelEndpointUrl, dmzEnabled, dmzChannels, dmzDvmKey, dmzAppLayerUrl, dmzNxsdName, operations]);
 
   const switchEnvironment = useCallback((newEnv) => {
     if (newEnv === generatedEnv || generatedFiles.length === 0) return;
     const oldEnv = generatedEnv;
-    const oldSiebelUrl = SIEBEL_ENDPOINTS[oldEnv] || "";
-    const newSiebelUrl = SIEBEL_ENDPOINTS[newEnv] || "";
+    const oldCfg = ENV_CONFIG[oldEnv] || ENV_CONFIG.UAT;
+    const newCfg = ENV_CONFIG[newEnv] || ENV_CONFIG.UAT;
+    const oldSiebelUrl = oldCfg.siebelEndpoint;
+    const newSiebelUrl = newCfg.siebelEndpoint;
 
     const updated = generatedFiles.map(f => {
       let content = f.content;
-      // Swap CRMNex{ENV}Ext in URI paths and URLs
-      content = content.replaceAll(`CRMNex${oldEnv}Ext`, `CRMNex${newEnv}Ext`);
+      // Swap CRMNex{ENV_CODE}Ext in URI paths and URLs
+      content = content.replaceAll(`CRMNex${oldCfg.uriEnvCode}Ext`, `CRMNex${newCfg.uriEnvCode}Ext`);
       // Swap Siebel endpoint URLs
       if (oldSiebelUrl && newSiebelUrl) {
         content = content.replaceAll(escXml(oldSiebelUrl), escXml(newSiebelUrl));
         content = content.replaceAll(oldSiebelUrl, newSiebelUrl);
       }
+      // Swap App Layer base URLs (DMZ → App)
+      content = content.replaceAll(oldCfg.appLayerBaseUrl, newCfg.appLayerBaseUrl);
       return { ...f, content };
     });
 
@@ -5414,10 +5435,10 @@ export default function OSBServiceGenerator() {
     setEnvironment(newEnv);
 
     // Update source state so "New Service" / re-gen stays in sync
-    if (serviceName && !manualEdits.uriPath) setUriPath(`/CRMNex${newEnv}Ext/${serviceName}`);
-    if (!manualEdits.dmzAppLayerUrl) setDmzAppLayerUrl(`http://10.59.17.65/CRMNex${newEnv}Ext/${serviceName}`);
-    if (SIEBEL_ENDPOINTS[newEnv]) {
-      setOperations(prev => prev.map(o => ({ ...o, siebelEndpointUrl: SIEBEL_ENDPOINTS[newEnv] })));
+    if (serviceName && !manualEdits.uriPath) setUriPath(`/CRMNex${newCfg.uriEnvCode}Ext/${serviceName}`);
+    if (!manualEdits.dmzAppLayerUrl) setDmzAppLayerUrl(`${newCfg.appLayerBaseUrl}/CRMNex${newCfg.uriEnvCode}Ext/${serviceName}`);
+    if (newSiebelUrl) {
+      setOperations(prev => prev.map(o => ({ ...o, siebelEndpointUrl: newSiebelUrl })));
     }
 
     // Re-validate
@@ -5607,15 +5628,24 @@ export default function OSBServiceGenerator() {
                 </select>
               </div>
               <div>
-                <label style={{ fontSize: 11, color: "#a3a3a3", fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, display: "block", marginBottom: 4 }}>Auth Policy</label>
-                <select value={authPolicy} onChange={e => setAuthPolicy(e.target.value)}
-                  style={{ width: "100%", background: "#141414", border: "1px solid #333333", borderRadius: 8, padding: "10px 12px", color: "#e5e5e5", fontSize: 13, fontFamily: "'JetBrains Mono', monospace" }}>
-                  {AUTH_POLICIES.map(a => <option key={a} value={a}>{a}</option>)}
-                </select>
-                {authPolicy === "Custom" && (
-                  <input value={customAuth} onChange={e => setCustomAuth(e.target.value)} placeholder="Enter custom auth expression"
-                    style={{ width: "100%", boxSizing: "border-box", marginTop: 8, background: "#141414", border: "1px solid #333333", borderRadius: 8, padding: "10px 12px", color: "#e5e5e5", fontSize: 13, fontFamily: "'JetBrains Mono', monospace" }} />
-                )}
+                <label style={{ fontSize: 11, color: "#a3a3a3", fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, display: "block", marginBottom: 4 }}>Auth Users</label>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+                  {authUsers.map((u, i) => (
+                    <div key={i} style={{ display: "flex", alignItems: "center", gap: 4, background: "#1c1c1c", border: "1px solid #404040", borderRadius: 6, padding: "4px 8px" }}>
+                      <input value={u} onChange={e => { const nu = [...authUsers]; nu[i] = e.target.value; setAuthUsers(nu); }}
+                        style={{ background: "transparent", border: "none", color: "#e5e5e5", fontSize: 12, fontFamily: "'JetBrains Mono', monospace", width: Math.max(80, u.length * 8), outline: "none" }} />
+                      {authUsers.length > 1 && (
+                        <button onClick={() => setAuthUsers(authUsers.filter((_, idx) => idx !== i))}
+                          style={{ background: "none", border: "none", color: "#ef4444", cursor: "pointer", fontSize: 14, fontWeight: 700, padding: 0, lineHeight: 1 }}>×</button>
+                      )}
+                    </div>
+                  ))}
+                  <button onClick={() => setAuthUsers([...authUsers, ""])}
+                    style={{ background: "#d4d4d4", color: "#0a0a0a", border: "none", borderRadius: 6, padding: "4px 10px", fontSize: 12, fontWeight: 700, cursor: "pointer", fontFamily: "'JetBrains Mono', monospace" }}>+</button>
+                </div>
+                <div style={{ fontSize: 10, color: "#525252", fontFamily: "'JetBrains Mono', monospace", marginTop: 4 }}>
+                  Generates: Usr({authUsers.join(",")})
+                </div>
               </div>
             </div>
 
@@ -5899,7 +5929,7 @@ export default function OSBServiceGenerator() {
                     ))}
                   </div>
                   <div style={{ fontSize: 9, color: "#525252", fontFamily: "'JetBrains Mono', monospace", marginBottom: 4 }}>
-                    DVM: {dmzDvmKey || `${serviceName || "Service"}_Mobility`}{dmzChannels.ssf ? ` · SSF DVM: SSFAESKeys.dvm (SSF_\{op\})` : ""} · NXSD: {dmzNxsdName || `nxsd_${serviceName || "Service"}`} · URL: {dmzAppLayerUrl || `http://10.59.17.65/CRMNex${environment}Ext/${serviceName || "Service"}`}
+                    DVM: {dmzDvmKey || `${serviceName || "Service"}_Mobility`}{dmzChannels.ssf ? ` · SSF DVM: SSFAESKeys.dvm (SSF_\{op\})` : ""} · NXSD: {dmzNxsdName || `nxsd_${serviceName || "Service"}`} · URL: {dmzAppLayerUrl || `${(ENV_CONFIG[environment] || ENV_CONFIG.UAT).appLayerBaseUrl}/CRMNex${(ENV_CONFIG[environment] || ENV_CONFIG.UAT).uriEnvCode}Ext/${serviceName || "Service"}`}
                   </div>
                   <button onClick={() => setShowDmzAdvanced(!showDmzAdvanced)}
                     style={{ background: "none", border: "none", color: "#525252", fontSize: 10, fontFamily: "'JetBrains Mono', monospace", cursor: "pointer", padding: "2px 0", display: "flex", alignItems: "center", gap: 4 }}>
