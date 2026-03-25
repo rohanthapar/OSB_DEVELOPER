@@ -4832,10 +4832,10 @@ function FilePreview({ files, activeFile, setActiveFile, fileValidation = {} }) 
   return (
     <div style={{ background: "#141414", borderRadius: 12, border: "1px solid #262626", overflow: "hidden" }}>
       <div style={{ display: "flex", flexWrap: "wrap", gap: 0, borderBottom: "1px solid #262626", background: "#0a0a0a" }}>
-        {files.map(f => {
+        {files.map((f, fi) => {
           const val = fileValidation[f.path];
           return (
-            <button key={f.path} onClick={() => setActiveFile(f.path)}
+            <button key={`${f.layer || "app"}-${fi}-${f.path}`} onClick={() => setActiveFile(f.path)}
               style={{
                 background: f.path === current.path ? "#1c1c1c" : "transparent",
                 color: f.path === current.path ? "#d4d4d4" : "#737373",
