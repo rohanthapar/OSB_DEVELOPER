@@ -3184,7 +3184,7 @@ ${c.extraActions || ""}
                 </con:actions>
             </con:stage>`;
 
-    const ssfOamStage = `
+    const ssfOamStage = !hasSSF ? "" : `
             <con:stage name="SSFValidateTokenOAMCallStage" errorHandler="${ehSSFOam.name}" id="${sid()}" xmlns:con1="http://www.bea.com/wli/sb/stages/config" xmlns:con3="http://www.bea.com/wli/sb/stages/config">
                 <con:context>
                     <con3:userNsDecl prefix="v1" namespace="${namespace}"/>
