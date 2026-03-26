@@ -259,7 +259,350 @@ const createDefaultOp = (opName = "") => ({
   parsedOdsReqFields: null,
   parsedOdsResFields: null,
   manualEdits: {},
+  isExisting: false,
 });
+
+// ─── JAR PARSER (Scenario 3) ────────────────────────────────
+
+function parseSchemaElements(schemaXml) {
+  const cdataMatch = schemaXml.match(/<con:schema>\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*<\/con:schema>/);
+  if (!cdataMatch) return [];
+  const xsd = cdataMatch[1];
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(xsd, 'text/xml');
+  const xsdNs = 'http://www.w3.org/2001/XMLSchema';
+  const results = [];
+  const topElements = doc.documentElement.children;
+
+  for (let i = 0; i < topElements.length; i++) {
+    const el = topElements[i];
+    if (el.localName !== 'element') continue;
+    const name = el.getAttribute('name');
+    if (!name) continue;
+
+    const fields = [];
+    const complexType = el.getElementsByTagNameNS(xsdNs, 'complexType')[0];
+    const sequence = complexType?.getElementsByTagNameNS(xsdNs, 'sequence')[0];
+    if (sequence) {
+      for (let j = 0; j < sequence.children.length; j++) {
+        const child = sequence.children[j];
+        if (child.localName !== 'element') continue;
+        const fieldName = child.getAttribute('name');
+        if (!fieldName) continue;
+        const maxOccurs = child.getAttribute('maxOccurs');
+        const isList = maxOccurs === 'unbounded';
+        const innerComplex = child.getElementsByTagNameNS(xsdNs, 'complexType')[0];
+        const isGroup = !!innerComplex && !isList;
+        const field = { name: fieldName, type: 'string', optional: true, isList, isGroup, children: [], odsMapping: '', siebelMapping: '' };
+        if (innerComplex) {
+          const innerSeq = innerComplex.getElementsByTagNameNS(xsdNs, 'sequence')[0];
+          if (innerSeq) {
+            for (let k = 0; k < innerSeq.children.length; k++) {
+              const gc = innerSeq.children[k];
+              if (gc.localName !== 'element') continue;
+              field.children.push({ name: gc.getAttribute('name') || '', type: 'string', optional: true, isList: false, isGroup: false, children: [], odsMapping: '', siebelMapping: '' });
+            }
+          }
+        }
+        fields.push(field);
+      }
+    }
+    results.push({ name, fields });
+  }
+  return results;
+}
+
+function parsePipelineOps(pipelineXml) {
+  const ops = [];
+  const branchRegex = /<con:branch\s+name="([^"]+)">/g;
+  let match;
+  while ((match = branchRegex.exec(pipelineXml)) !== null) {
+    const opName = match[1];
+    const branchStart = match.index;
+    const branchEnd = pipelineXml.indexOf('</con:branch>', branchStart);
+    if (branchEnd === -1) continue;
+    const branchContent = pipelineXml.substring(branchStart, branchEnd);
+    const isODS = branchContent.includes('CommonSBProject/proxy/LocalSiebelQueryToDBPS');
+    let odsServiceId = '';
+    if (isODS) {
+      const sidMatch = branchContent.match(/IP_SERVICE_ID[^>]*>(\d+)/);
+      if (sidMatch) odsServiceId = sidMatch[1];
+    }
+    ops.push({ operationName: opName, serviceType: isODS ? 'ODS' : 'Siebel', odsServiceId });
+  }
+
+  // Fallback: if any ODS op has blank service ID, search the full pipeline XML
+  const odsOpsNeedingId = ops.filter(o => o.serviceType === 'ODS' && !o.odsServiceId);
+  if (odsOpsNeedingId.length > 0) {
+    const allIds = [...pipelineXml.matchAll(/IP_SERVICE_ID[^>]*>(\d+)/g)].map(m => m[1]);
+    if (allIds.length === 1) {
+      // Unambiguous: assign to all ODS ops missing ID
+      odsOpsNeedingId.forEach(o => { o.odsServiceId = allIds[0]; });
+    } else if (allIds.length > 1) {
+      // Multiple IDs: assign in order to ODS ops missing ID
+      odsOpsNeedingId.forEach((o, i) => { if (allIds[i]) o.odsServiceId = allIds[i]; });
+    }
+  }
+
+  // For single-op pipelines (no branch table), detect type from overall content
+  let singleOpInfo = null;
+  if (ops.length === 0) {
+    const isODS = pipelineXml.includes('CommonSBProject/proxy/LocalSiebelQueryToDBPS');
+    let odsServiceId = '';
+    if (isODS) {
+      const sidMatch = pipelineXml.match(/IP_SERVICE_ID[^>]*>(\d+)/);
+      if (sidMatch) odsServiceId = sidMatch[1];
+    }
+    singleOpInfo = { serviceType: isODS ? 'ODS' : 'Siebel', odsServiceId };
+  }
+
+  return { ops, singleOpInfo };
+}
+
+function parseProxyInfo(proxyXml) {
+  let uriPath = '';
+  let authUsers = ['dmz_user'];
+  const uriMatch = proxyXml.match(/<tran:URI>\s*<env:value>([^<]+)<\/env:value>/);
+  if (uriMatch) uriPath = uriMatch[1];
+  // Capture ALL Usr() groups (pipe-separated: Usr(portal_user)|Usr(dmz_user,mobility_user))
+  const usrMatches = [...proxyXml.matchAll(/Usr\(([^)]+)\)/g)];
+  if (usrMatches.length > 0) {
+    const allUsers = new Set();
+    for (const m of usrMatches) {
+      m[1].split(',').forEach(u => allUsers.add(u.trim()));
+    }
+    authUsers = [...allUsers];
+  }
+  return { uriPath, authUsers };
+}
+
+function parseXQueryMappings(xqXml, isRequest) {
+  const cdataMatch = xqXml.match(/<con:xquery>\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*<\/con:xquery>/);
+  if (!cdataMatch) return { fieldMap: {}, targetElement: '' };
+  const xq = cdataMatch[1];
+  const fieldMap = {};
+
+  // Simple field mappings: <prefix:A>{fn:data($var/prefix:B)}</prefix:A>
+  const regex = /<\w+:(\w+)>\{fn:data\(\$\w+\/\w+:(\w+)\)\}<\/\w+:\1>/g;
+  let m;
+  while ((m = regex.exec(xq)) !== null) {
+    if (isRequest) {
+      fieldMap[m[2]] = m[1]; // appField → targetField
+    } else {
+      fieldMap[m[1]] = m[2]; // appField → sourceField
+    }
+  }
+
+  // List field mappings: for $item in $var/prefix:ListMapping ... <prefix:Child>{fn:data($item/prefix:ChildMapping)}</prefix:Child>
+  const listRegex = /for\s+\$item\s+in\s+\$\w+\/\w+:(\w+)(?:\/\w+:\w+)?\s*\n?\s*return\s*\n?\s*<\w+:(\w+)>/g;
+  while ((m = listRegex.exec(xq)) !== null) {
+    if (isRequest) {
+      fieldMap[`__list__${m[2]}`] = m[1]; // not used directly but available
+    } else {
+      fieldMap[`__list__${m[2]}`] = m[1];
+    }
+  }
+
+  // Extract target element: first element in the function body
+  let targetElement = '';
+  // Match function body: local:func(...) { <prefix:ElementName> or local:func(...) as ... { <prefix:ElementName>
+  const funcMatch = xq.match(/local:func\([\s\S]*?\)\s*(?:as\s+[\s\S]*?)?\{\s*\n?\s*<\w+:(\w+)>/);
+  if (funcMatch) targetElement = funcMatch[1];
+
+  // Extract source element from schema-element declaration (for Siebel response)
+  let sourceElement = '';
+  const schemaElMatch = xq.match(/declare\s+variable\s+\$(?:InputRequest|reqMsg)\s+as\s+element\(\)\s*\(::\s*schema-element\(\w+:(\w+)\)\s*::\)/);
+  if (schemaElMatch) sourceElement = schemaElMatch[1];
+
+  return { fieldMap, targetElement, sourceElement };
+}
+
+function parseBSInfo(bsXml) {
+  let wsdlRef = '', portName = '', endpointUrl = '';
+  const wsdlMatch = bsXml.match(/<con:wsdl\s+ref="[^"]*\/Resources\/([^"]+)"/);
+  if (wsdlMatch) wsdlRef = wsdlMatch[1];
+  const portMatch = bsXml.match(/<con:port>\s*<con:name>([^<]+)<\/con:name>/);
+  if (portMatch) portName = portMatch[1];
+  const urlMatch = bsXml.match(/<tran:URI>\s*<env:value>([^<]+)<\/env:value>/);
+  if (urlMatch) endpointUrl = urlMatch[1];
+  return { wsdlRef, portName, endpointUrl };
+}
+
+async function parseExistingJar(file, targetService) {
+  const zip = await JSZip.loadAsync(file);
+  const filePaths = Object.keys(zip.files).filter(f => !zip.files[f].dir);
+
+  // Detect project name from folder structure
+  const projectName = filePaths[0]?.split('/')[0] || '';
+  if (!projectName) throw new Error('Could not detect project name from JAR');
+
+  // Find all schema files (= service names), excluding nxsd_ and _folderdata
+  const schemaFiles = filePaths.filter(f => /\/schema\/[^/_][^/]*\.XMLSchema$/.test(f) && !f.includes('nxsd_'));
+  const serviceNames = schemaFiles.map(f => f.split('/').pop().replace('.XMLSchema', ''));
+  if (serviceNames.length === 0) throw new Error('No schema files found in JAR');
+
+  // If multiple services and no target specified, return choices
+  if (serviceNames.length > 1 && !targetService) {
+    return { needsSelection: true, projectName, serviceNames };
+  }
+
+  const serviceName = targetService || serviceNames[0];
+  const schemaFile = schemaFiles.find(f => f.includes(`/${serviceName}.XMLSchema`));
+  if (!schemaFile) throw new Error(`Schema not found for service: ${serviceName}`);
+
+  // Parse schema
+  const schemaContent = await zip.file(schemaFile).async('string');
+  const schemaElements = parseSchemaElements(schemaContent);
+
+  // Find pipeline matching this service (look for serviceName or proxyName in filename)
+  const pipelineFile = filePaths.find(f =>
+    /\/proxy\/.*Pipeline\.Pipeline$/.test(f) &&
+    (f.toLowerCase().includes(serviceName.toLowerCase()) ||
+     f.includes(`${serviceName}PS`))
+  ) || filePaths.find(f => /\/proxy\/.*Pipeline\.Pipeline$/.test(f)); // fallback to first
+  let pipelineOps = [];
+  let pipelineSingleOpInfo = null;
+  if (pipelineFile) {
+    const pipelineContent = await zip.file(pipelineFile).async('string');
+    const pipelineResult = parsePipelineOps(pipelineContent);
+    pipelineOps = pipelineResult.ops;
+    pipelineSingleOpInfo = pipelineResult.singleOpInfo;
+  }
+
+  // Find proxy service matching this service
+  const proxyFile = filePaths.find(f =>
+    /\/proxy\/[^/]+\.ProxyService$/.test(f) &&
+    (f.toLowerCase().includes(serviceName.toLowerCase()) ||
+     f.includes(`${serviceName}PS`))
+  ) || filePaths.find(f => /\/proxy\/[^/]+\.ProxyService$/.test(f));
+  let proxyInfo = { uriPath: '', authUsers: ['dmz_user'] };
+  let proxyName = '';
+  if (proxyFile) {
+    const proxyContent = await zip.file(proxyFile).async('string');
+    proxyInfo = parseProxyInfo(proxyContent);
+    proxyName = proxyFile.split('/').pop().replace('.ProxyService', '');
+  }
+
+  // Parse XQuery files — match by service name or operation name patterns
+  const xqFiles = filePaths.filter(f => /\/transformation\/.*\.Xquery$/.test(f));
+  const xqMappings = {};
+  for (const xqPath of xqFiles) {
+    const content = await zip.file(xqPath).async('string');
+    const fileName = xqPath.split('/').pop().replace('.Xquery', '');
+    // Handle both "OpNameRequestXQ" and "OpNameRequest" naming patterns
+    const isRequest = /Request(XQ)?$/.test(fileName);
+    const isResponse = /Response(XQ)?$/.test(fileName);
+    if (!isRequest && !isResponse) continue;
+    const opName = fileName.replace(/Request(XQ)?$|Response(XQ)?$/, '');
+    if (!xqMappings[opName]) xqMappings[opName] = {};
+    xqMappings[opName][isRequest ? 'request' : 'response'] = parseXQueryMappings(content, isRequest);
+  }
+
+  // Parse BusinessService files
+  const bsFiles = filePaths.filter(f => /\/business\/.*BS\.BusinessService$/.test(f));
+  const bsInfo = {};
+  for (const bsPath of bsFiles) {
+    const content = await zip.file(bsPath).async('string');
+    const opName = bsPath.split('/').pop().replace('BS.BusinessService', '');
+    bsInfo[opName] = parseBSInfo(content);
+  }
+
+  // Read Siebel WSDL files from Resources
+  const resourceWsdls = filePaths.filter(f => /\/Resources\/.*\.WSDL$/.test(f));
+  const siebelWsdlContents = {};
+  for (const wf of resourceWsdls) {
+    const content = await zip.file(wf).async('string');
+    const name = wf.split('/').pop().replace('.WSDL', '');
+    const cdMatch = content.match(/<con:wsdl>\s*<!\[CDATA\[([\s\S]*?)\]\]>\s*<\/con:wsdl>/);
+    siebelWsdlContents[name] = cdMatch ? cdMatch[1] : '';
+  }
+
+  // Determine operation list — use pipeline ops if available, else infer from schema
+  const singleOpInfo = pipelineSingleOpInfo || { serviceType: 'ODS', odsServiceId: '' };
+  let opList;
+  if (pipelineOps.length > 0) {
+    opList = pipelineOps;
+  } else {
+    // Try standard naming first (OpNameRequest/OpNameResponse pairs)
+    const reqElements = schemaElements.filter(e => e.name.endsWith('Request'));
+    if (reqElements.length > 0) {
+      opList = reqElements.map(e => ({
+        operationName: e.name.replace(/Request$/, ''),
+        serviceType: singleOpInfo.serviceType,
+        odsServiceId: singleOpInfo.odsServiceId,
+      }));
+    } else {
+      // Non-standard naming (e.g. FetchLoyMemEnhncInp / FetchMemberEnhanceOutput)
+      // Treat as single operation using the service name, pair elements as req[0]/res[1]
+      opList = [{
+        operationName: serviceName,
+        serviceType: singleOpInfo.serviceType,
+        odsServiceId: singleOpInfo.odsServiceId,
+        // Store original schema element names for lookup
+        _reqElName: schemaElements[0]?.name || '',
+        _resElName: schemaElements[1]?.name || '',
+      }];
+    }
+  }
+
+  // Build operation objects
+  const operations = opList.map(po => {
+    const opName = po.operationName;
+    // Try standard naming, then fall back to explicit element names from opList
+    const reqEl = schemaElements.find(e => e.name === `${opName}Request`)
+      || (po._reqElName ? schemaElements.find(e => e.name === po._reqElName) : null);
+    const resEl = schemaElements.find(e => e.name === `${opName}Response`)
+      || (po._resElName ? schemaElements.find(e => e.name === po._resElName) : null);
+    // For XQuery matching, try opName first, then serviceName, then partial matches
+    const xqMap = xqMappings[opName] || xqMappings[serviceName]
+      || Object.values(xqMappings).find(v => v.request || v.response) || {};
+    const bs = bsInfo[opName] || bsInfo[serviceName]
+      || Object.values(bsInfo)[0] || {};
+    const mappingKey = po.serviceType === 'ODS' ? 'odsMapping' : 'siebelMapping';
+
+    const applyMappings = (fields, xqData) => {
+      if (!xqData?.fieldMap) return fields;
+      return fields.map(f => {
+        const mapped = xqData.fieldMap[f.name] || '';
+        const updated = { ...f, [mappingKey]: mapped };
+        if (f.children?.length > 0 && xqData.fieldMap) {
+          updated.children = f.children.map(c => ({ ...c, [mappingKey]: xqData.fieldMap[c.name] || '' }));
+        }
+        return updated;
+      });
+    };
+
+    const requestFields = reqEl ? applyMappings(reqEl.fields, xqMap.request) : createDefaultOp().requestFields;
+    const responseFields = resEl ? applyMappings(resEl.fields, xqMap.response) : createDefaultOp().responseFields;
+
+    const siebelWsdlRef = bs.wsdlRef || '';
+    const siebelWsdlRaw = siebelWsdlContents[siebelWsdlRef] || '';
+
+    return {
+      ...createDefaultOp(opName),
+      operationName: opName,
+      requestElement: reqEl?.name || `${opName}Request`,
+      responseElement: resEl?.name || `${opName}Response`,
+      serviceType: po.serviceType,
+      requestFields,
+      responseFields,
+      odsServiceId: po.odsServiceId || '',
+      odsRequestElement: xqMap.request?.targetElement || '',
+      odsResponseElement: xqMap.response?.targetElement || '',
+      siebelWsdlRef,
+      siebelWsdlRaw,
+      siebelWsdlParsed: !!siebelWsdlRaw,
+      siebelPortName: bs.portName || '',
+      siebelEndpointUrl: bs.endpointUrl || SIEBEL_ENDPOINTS["UAT"],
+      siebelInputElement: xqMap.request?.targetElement || '',
+      siebelOutputElement: xqMap.response?.sourceElement || '',
+      isExisting: true,
+      manualEdits: { operationName: true, requestElement: true, responseElement: true },
+    };
+  });
+
+  return { projectName, serviceName, proxyName, operations, uriPath: proxyInfo.uriPath, authUsers: proxyInfo.authUsers };
+}
 
 // ─── XML VALIDATION ─────────────────────────────────────────
 function validateXmlString(xmlString) {
@@ -4081,6 +4424,42 @@ function jsonToFields(json) {
   } catch { return null; }
 }
 
+// ─── FIELDS TO JSON (reverse of jsonToFields — for displaying existing op data) ─
+function fieldsToJson(fields) {
+  if (!fields || fields.length === 0) return {};
+  const obj = {};
+  for (const f of fields) {
+    if (f.isList && f.children?.length > 0) {
+      const child = {};
+      for (const c of f.children) child[c.name] = "";
+      obj[f.name] = [child];
+    } else if (f.isGroup && f.children?.length > 0) {
+      obj[f.name] = fieldsToJson(f.children);
+    } else {
+      obj[f.name] = "";
+    }
+  }
+  return obj;
+}
+
+function fieldsToMappedJson(fields, mappingKey) {
+  if (!fields || fields.length === 0) return {};
+  const obj = {};
+  for (const f of fields) {
+    const mapped = f[mappingKey] || f.name;
+    if (f.isList && f.children?.length > 0) {
+      const child = {};
+      for (const c of f.children) child[c[mappingKey] || c.name] = "";
+      obj[mapped] = [child];
+    } else if (f.isGroup && f.children?.length > 0) {
+      obj[mapped] = fieldsToMappedJson(f.children, mappingKey);
+    } else {
+      obj[mapped] = "";
+    }
+  }
+  return obj;
+}
+
 // ─── ODS SAMPLE PARSER ──────────────────────────────────────
 function parseOdsSample(text) {
   if (!text?.trim()) return null;
@@ -4917,6 +5296,13 @@ function InfoTooltip({ children, title }) {
 
 export default function OSBServiceGenerator() {
   const [scenario, setScenario] = useState(1);
+  // JAR upload state (Scenario 3)
+  const [jarParsing, setJarParsing] = useState(false);
+  const [jarError, setJarError] = useState('');
+  const [existingOpCount, setExistingOpCount] = useState(0);
+  const [jarServices, setJarServices] = useState([]); // Available services when multiple found
+  const jarInputRef = useRef(null);
+  const jarFileRef = useRef(null); // Store uploaded file for re-parse after service selection
   // Project-level state
   const [projectName, setProjectName] = useState("");
   const [serviceName, setServiceName] = useState("");
@@ -5016,9 +5402,76 @@ export default function OSBServiceGenerator() {
   };
   const removeOperation = (idx) => {
     if (operations.length <= 1) return;
+    if (operations[idx]?.isExisting) return; // Cannot remove existing operations
     setOperations(prev => prev.filter((_, i) => i !== idx));
     setActiveOpIdx(prev => prev >= idx && prev > 0 ? prev - 1 : prev);
   };
+
+  // JAR upload handler (Scenario 3)
+  const populateFromParsedJar = useCallback((parsed) => {
+    setProjectName(parsed.projectName);
+    setServiceName(parsed.serviceName);
+    if (parsed.proxyName) { setProxyName(parsed.proxyName); setManualEdits(prev => ({ ...prev, proxyName: true })); }
+    if (parsed.uriPath) { setUriPath(parsed.uriPath); setManualEdits(prev => ({ ...prev, uriPath: true })); }
+    if (parsed.authUsers?.length) setAuthUsers(parsed.authUsers);
+    const newOp = createDefaultOp();
+    setOperations([...parsed.operations, newOp]);
+    setExistingOpCount(parsed.operations.length);
+    setActiveOpIdx(parsed.operations.length);
+    setJarServices([]);
+  }, []);
+
+  const handleJarUpload = useCallback(async (file) => {
+    if (!file) return;
+    jarFileRef.current = file;
+    setJarParsing(true);
+    setJarError('');
+    setJarServices([]);
+    try {
+      const parsed = await parseExistingJar(file);
+      if (parsed.needsSelection) {
+        setProjectName(parsed.projectName);
+        setJarServices(parsed.serviceNames);
+        setJarParsing(false);
+        return;
+      }
+      populateFromParsedJar(parsed);
+      setJarParsing(false);
+    } catch (err) {
+      setJarError(err.message || 'Failed to parse JAR');
+      setJarParsing(false);
+    }
+  }, [populateFromParsedJar]);
+
+  const handleJarServiceSelect = useCallback(async (svcName) => {
+    if (!jarFileRef.current) return;
+    setJarParsing(true);
+    setJarError('');
+    try {
+      const parsed = await parseExistingJar(jarFileRef.current, svcName);
+      populateFromParsedJar(parsed);
+      setJarParsing(false);
+    } catch (err) {
+      setJarError(err.message || 'Failed to parse JAR');
+      setJarParsing(false);
+    }
+  }, [populateFromParsedJar]);
+
+  // Reset JAR state when switching scenarios
+  const handleScenarioChange = useCallback((id) => {
+    setScenario(id);
+    if (id !== 3) {
+      setJarError('');
+      setExistingOpCount(0);
+      setJarServices([]);
+      // Remove existing-flagged ops, keep only non-existing or reset to default
+      setOperations(prev => {
+        const nonExisting = prev.filter(o => !o.isExisting);
+        return nonExisting.length > 0 ? nonExisting : [createDefaultOp()];
+      });
+      setActiveOpIdx(0);
+    }
+  }, []);
 
   // markManual routes per-op fields to op.manualEdits, project fields to global manualEdits
   const OP_MANUAL_FIELDS = ['operationName', 'requestElement', 'responseElement'];
@@ -5209,6 +5662,15 @@ export default function OSBServiceGenerator() {
     if (!projectName.trim()) err("Project Name is required");
     if (!serviceName.trim()) err("Service Name is required");
 
+    // Scenario 3: require at least one new operation
+    if (scenario === 3) {
+      if (existingOpCount === 0) err("Upload existing project JAR first");
+      const newOps = operations.filter(o => !o.isExisting);
+      if (newOps.length === 0) err("Add at least one new operation");
+      const emptyNewOps = newOps.filter(o => !o.operationName.trim());
+      if (emptyNewOps.length > 0) err("New operation(s) need an Operation Name");
+    }
+
     // Check for duplicate operation names
     const opNames = operations.map(o => o.operationName || serviceName);
     const dupes = opNames.filter((n, i) => opNames.indexOf(n) !== i);
@@ -5270,7 +5732,7 @@ export default function OSBServiceGenerator() {
     });
 
     return errors;
-  }, [projectName, serviceName, operations]);
+  }, [projectName, serviceName, operations, scenario, existingOpCount]);
 
   const handleGenerate = useCallback(() => {
     const errs = validate();
@@ -5319,6 +5781,7 @@ export default function OSBServiceGenerator() {
       siebelPortName: op.siebelPortName,
       siebelEndpointUrl: op.siebelEndpointUrl,
       siebelWsdlRaw: op.siebelWsdlRaw,
+      isExisting: !!op.isExisting,
     }));
 
     // Shared files: Schema, WSDL, WADL (handles 1 or N operations)
@@ -5334,8 +5797,10 @@ export default function OSBServiceGenerator() {
     files.push({ path: `${p}/proxy/${effectivePipelineName}.Pipeline`, content: generateMultiOpPipeline(baseConfig, opConfigs) });
 
     // Per-operation files: XQuery pairs, BusinessService (Siebel only), Siebel WSDLs
+    // Skip existing ops — their files already exist in the JAR
     const siebelWsdlsSeen = new Set();
     opConfigs.forEach(opCfg => {
+      if (opCfg.isExisting) return;
       const opName = opCfg.operationName;
       if (opCfg.serviceType === 'ODS') {
         files.push({ path: `${p}/transformation/${opName}RequestXQ.Xquery`, content: generateRequestXQ_ODS(opCfg) });
@@ -5589,7 +6054,7 @@ export default function OSBServiceGenerator() {
               <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, fontWeight: 700, letterSpacing: 1.5, textTransform: "uppercase", color: "#a3a3a3", marginBottom: 10 }}>Scenario</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
                 {SCENARIOS.map(s => (
-                  <button key={s.id} onClick={() => setScenario(s.id)}
+                  <button key={s.id} onClick={() => handleScenarioChange(s.id)}
                     style={{
                       background: scenario === s.id ? "#292929" : "#1c1c1c",
                       border: scenario === s.id ? "2px solid #d4d4d4" : "1px solid #333333",
@@ -5604,17 +6069,63 @@ export default function OSBServiceGenerator() {
               </div>
             </div>
 
+            {/* JAR Upload (Scenario 3) */}
+            {scenario === 3 && (
+              <div style={{ marginBottom: 20, background: "#0a1628", border: "1px solid #1e3a5f", borderRadius: 10, padding: 16 }}>
+                <div style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 11, fontWeight: 700, color: "#60a5fa", marginBottom: 8 }}>
+                  Upload Existing Project JAR
+                </div>
+                <div style={{ fontSize: 11, color: "#737373", marginBottom: 12, lineHeight: 1.5 }}>
+                  Export your existing project from JDeveloper as a JAR/sbconfig file and upload it here. The tool will parse existing operations and let you add new ones.
+                </div>
+                <input ref={jarInputRef} type="file" accept=".jar,.zip,.sbconfig" style={{ display: 'none' }}
+                  onChange={e => { if (e.target.files?.[0]) handleJarUpload(e.target.files[0]); }} />
+                <button onClick={() => jarInputRef.current?.click()}
+                  disabled={jarParsing}
+                  style={{ background: jarParsing ? "#1e3a5f" : "#2563eb", color: "#fff", border: "none", borderRadius: 8, padding: "10px 20px", fontSize: 12, fontWeight: 700, cursor: jarParsing ? "wait" : "pointer", fontFamily: "'JetBrains Mono', monospace" }}>
+                  {jarParsing ? "Parsing..." : existingOpCount > 0 ? "Re-upload JAR" : "Choose JAR File"}
+                </button>
+                {jarError && (
+                  <div style={{ marginTop: 8, color: "#ef4444", fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>
+                    Error: {jarError}
+                  </div>
+                )}
+                {jarServices.length > 0 && (
+                  <div style={{ marginTop: 10, background: "#1a1a0a", border: "1px solid #4a4a1a", borderRadius: 8, padding: 12 }}>
+                    <div style={{ fontSize: 11, fontFamily: "'JetBrains Mono', monospace", color: "#fbbf24", fontWeight: 700, marginBottom: 8 }}>
+                      Multiple services found — select one to add operations to:
+                    </div>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      {jarServices.map(svc => (
+                        <button key={svc} onClick={() => handleJarServiceSelect(svc)}
+                          style={{ background: "#292929", border: "1px solid #404040", borderRadius: 6, padding: "6px 14px", color: "#e5e5e5", fontSize: 12, fontWeight: 600, cursor: "pointer", fontFamily: "'JetBrains Mono', monospace" }}>
+                          {svc}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {existingOpCount > 0 && !jarParsing && (
+                  <div style={{ marginTop: 10, background: "#0a2818", border: "1px solid #166534", borderRadius: 8, padding: "8px 12px", fontSize: 11, fontFamily: "'JetBrains Mono', monospace", color: "#4ade80" }}>
+                    Parsed {existingOpCount} existing operation{existingOpCount > 1 ? 's' : ''}: {operations.filter(o => o.isExisting).map(o => o.operationName).join(', ')}
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Core fields */}
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
               <div>
                 <label style={{ fontSize: 11, color: "#a3a3a3", fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, display: "block", marginBottom: 4 }}>Project Name</label>
                 <input value={projectName} onChange={e => setProjectName(e.target.value)} placeholder="e.g. LoyaltyMemberDetailsSBProject"
-                  style={{ width: "100%", boxSizing: "border-box", background: "#141414", border: "1px solid #333333", borderRadius: 8, padding: "10px 12px", color: "#e5e5e5", fontSize: 13, fontFamily: "'JetBrains Mono', monospace" }} />
+                  disabled={scenario === 3 && existingOpCount > 0}
+                  style={{ width: "100%", boxSizing: "border-box", background: scenario === 3 && existingOpCount > 0 ? "#0a0a0a" : "#141414", border: "1px solid #333333", borderRadius: 8, padding: "10px 12px", color: "#e5e5e5", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", opacity: scenario === 3 && existingOpCount > 0 ? 0.6 : 1 }} />
               </div>
               <div>
                 <label style={{ fontSize: 11, color: "#a3a3a3", fontFamily: "'JetBrains Mono', monospace", fontWeight: 600, display: "block", marginBottom: 4 }}>Service Name</label>
                 <input value={serviceName} onChange={e => setServiceName(e.target.value)} placeholder="e.g. FetchLoyaltyMemberEnhanced"
-                  style={{ width: "100%", boxSizing: "border-box", background: "#141414", border: "1px solid #333333", borderRadius: 8, padding: "10px 12px", color: "#e5e5e5", fontSize: 13, fontFamily: "'JetBrains Mono', monospace" }} />
+                  disabled={scenario === 3 && existingOpCount > 0}
+                  style={{ width: "100%", boxSizing: "border-box", background: scenario === 3 && existingOpCount > 0 ? "#0a0a0a" : "#141414", border: "1px solid #333333", borderRadius: 8, padding: "10px 12px", color: "#e5e5e5", fontSize: 13, fontFamily: "'JetBrains Mono', monospace", opacity: scenario === 3 && existingOpCount > 0 ? 0.6 : 1 }} />
               </div>
             </div>
 
@@ -5699,7 +6210,9 @@ export default function OSBServiceGenerator() {
                     }}>
                     {o.operationName || `Op ${i + 1}`}
                     <span style={{ fontSize: 9, color: o.serviceType === "ODS" ? "#6aa36a" : "#a3a36a", background: "#1c1c1c", borderRadius: 3, padding: "1px 4px" }}>{o.serviceType}</span>
-                    {operations.length > 1 && (
+                    {o.isExisting && <span style={{ fontSize: 8, color: "#60a5fa", background: "#0a1628", border: "1px solid #1e3a5f", borderRadius: 3, padding: "1px 4px" }}>EXISTING</span>}
+                    {!o.isExisting && scenario === 3 && <span style={{ fontSize: 8, color: "#4ade80", background: "#0a2818", border: "1px solid #166534", borderRadius: 3, padding: "1px 4px" }}>NEW</span>}
+                    {operations.length > 1 && !o.isExisting && (
                       <span onClick={e => { e.stopPropagation(); removeOperation(i); }}
                         style={{ color: "#525252", cursor: "pointer", fontSize: 13, marginLeft: 2 }}>×</span>
                     )}
@@ -6024,12 +6537,58 @@ export default function OSBServiceGenerator() {
                     }}>
                     {o.operationName || `Op ${i + 1}`}
                     <span style={{ fontSize: 9, marginLeft: 6, opacity: 0.6 }}>{o.serviceType}</span>
+                    {o.isExisting && <span style={{ fontSize: 8, marginLeft: 4, color: "#60a5fa", background: "#0a1628", border: "1px solid #1e3a5f", borderRadius: 3, padding: "1px 4px" }}>EXISTING</span>}
                   </button>
                 ))}
               </div>
             )}
+            {/* Existing operation summary */}
+            {op.isExisting && (
+              <div style={{ marginBottom: 16, background: "#0a1628", border: "1px solid #1e3a5f", borderRadius: 10, padding: 14 }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: "#60a5fa", fontFamily: "'JetBrains Mono', monospace", marginBottom: 8 }}>
+                  Parsed from JAR — {op.operationName}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                  <div>
+                    <div style={{ fontSize: 10, color: "#737373", fontFamily: "'JetBrains Mono', monospace", marginBottom: 4 }}>App Request ({requestFields.length} fields) — {requestElement}</div>
+                    <pre style={{ background: "#0d0d0d", border: "1px solid #333", borderRadius: 6, padding: 10, margin: 0, fontSize: 9, color: "#a3a3a3", fontFamily: "'JetBrains Mono', monospace", whiteSpace: "pre-wrap", maxHeight: 180, overflow: "auto" }}>
+                      {JSON.stringify(fieldsToJson(requestFields), null, 2)}
+                    </pre>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 10, color: "#737373", fontFamily: "'JetBrains Mono', monospace", marginBottom: 4 }}>App Response ({responseFields.length} fields) — {responseElement}</div>
+                    <pre style={{ background: "#0d0d0d", border: "1px solid #333", borderRadius: 6, padding: 10, margin: 0, fontSize: 9, color: "#a3a3a3", fontFamily: "'JetBrains Mono', monospace", whiteSpace: "pre-wrap", maxHeight: 180, overflow: "auto" }}>
+                      {JSON.stringify(fieldsToJson(responseFields), null, 2)}
+                    </pre>
+                  </div>
+                </div>
+                {/* ODS/Siebel-side mapped JSON */}
+                {(serviceType === "ODS" || serviceType === "Siebel") && (
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 10 }}>
+                    <div>
+                      <div style={{ fontSize: 10, color: serviceType === "ODS" ? "#6aa36a" : "#a3a36a", fontFamily: "'JetBrains Mono', monospace", marginBottom: 4 }}>{serviceType} Request</div>
+                      <pre style={{ background: "#0d0d0d", border: `1px solid ${serviceType === "ODS" ? "#2a3a2a" : "#3a3a2a"}`, borderRadius: 6, padding: 10, margin: 0, fontSize: 9, color: serviceType === "ODS" ? "#6aa36a" : "#a3a36a", fontFamily: "'JetBrains Mono', monospace", whiteSpace: "pre-wrap", maxHeight: 180, overflow: "auto" }}>
+                        {JSON.stringify(fieldsToMappedJson(requestFields, serviceType === "ODS" ? "odsMapping" : "siebelMapping"), null, 2)}
+                      </pre>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 10, color: serviceType === "ODS" ? "#6aa36a" : "#a3a36a", fontFamily: "'JetBrains Mono', monospace", marginBottom: 4 }}>{serviceType} Response</div>
+                      <pre style={{ background: "#0d0d0d", border: `1px solid ${serviceType === "ODS" ? "#2a3a2a" : "#3a3a2a"}`, borderRadius: 6, padding: 10, margin: 0, fontSize: 9, color: serviceType === "ODS" ? "#6aa36a" : "#a3a36a", fontFamily: "'JetBrains Mono', monospace", whiteSpace: "pre-wrap", maxHeight: 180, overflow: "auto" }}>
+                        {JSON.stringify(fieldsToMappedJson(responseFields, serviceType === "ODS" ? "odsMapping" : "siebelMapping"), null, 2)}
+                      </pre>
+                    </div>
+                  </div>
+                )}
+                {serviceType === "ODS" && odsServiceId && (
+                  <div style={{ marginTop: 8, fontSize: 10, color: "#6aa36a", fontFamily: "'JetBrains Mono', monospace" }}>ODS Service ID: {odsServiceId} | ODS Element: {odsRequestElement || "—"}</div>
+                )}
+                {serviceType === "Siebel" && siebelPortName && (
+                  <div style={{ marginTop: 8, fontSize: 10, color: "#a3a36a", fontFamily: "'JetBrains Mono', monospace" }}>Siebel Port: {siebelPortName} | WSDL: {siebelWsdlRef || "—"}</div>
+                )}
+              </div>
+            )}
             {/* JSON Paste Section */}
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
+            {!op.isExisting && (<><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
               {[
                 { label: "Request JSON", setter: setRequestFields, wsdlFields: siebelInputFields },
                 { label: "Response JSON", setter: setResponseFields, wsdlFields: siebelOutputFields },
@@ -6040,7 +6599,6 @@ export default function OSBServiceGenerator() {
                     onChange={e => {
                       const parsed = jsonToFields(e.target.value);
                       if (parsed) {
-                        // If Siebel WSDL was already parsed, auto-map the new fields immediately
                         if (serviceType === "Siebel" && wsdlFields && wsdlFields.length > 0) {
                           setter(autoMapSiebelFields(parsed, wsdlFields));
                         } else {
@@ -6055,9 +6613,10 @@ export default function OSBServiceGenerator() {
             <div style={{ fontSize: 11, color: "#525252", fontFamily: "'JetBrains Mono', monospace", marginBottom: 16 }}>
               Paste JSON above to auto-populate app fields, or edit manually below
             </div>
+            </>)}
 
-            {/* ODS Sample Paste Section */}
-            {serviceType === "ODS" && (
+            {/* ODS Sample Paste Section (hide for existing ops — already mapped) */}
+            {serviceType === "ODS" && !op.isExisting && (
               <div style={{ background: "#ffffff08", borderRadius: 10, border: "1px solid #333333", padding: 16, marginBottom: 20 }}>
                 <div style={{ display: "flex", alignItems: "center", marginBottom: 10 }}>
                   <span style={{ fontSize: 12, color: "#d4d4d4", fontWeight: 700, fontFamily: "'JetBrains Mono', monospace" }}>ODS Field Mapping</span>
@@ -6196,6 +6755,7 @@ export default function OSBServiceGenerator() {
                     }}>
                     {o.operationName || `Op ${i + 1}`}
                     <span style={{ fontSize: 9, marginLeft: 6, opacity: 0.6 }}>{o.serviceType}</span>
+                    {o.isExisting && <span style={{ fontSize: 8, marginLeft: 4, color: "#60a5fa", background: "#0a1628", border: "1px solid #1e3a5f", borderRadius: 3, padding: "1px 4px" }}>EXISTING</span>}
                   </button>
                 ))}
               </div>
@@ -6275,7 +6835,7 @@ export default function OSBServiceGenerator() {
                   {ENVIRONMENTS.map(e => <option key={e} value={e}>{e}</option>)}
                 </select>
               </div>
-              <button onClick={() => { setStep(1); setGeneratedFiles([]); }}
+              <button onClick={() => { setStep(1); setGeneratedFiles([]); setExistingOpCount(0); setJarError(''); setJarServices([]); }}
                 style={{ background: "#1c1c1c", color: "#a3a3a3", border: "1px solid #333333", borderRadius: 8, padding: "10px 20px", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "'JetBrains Mono', monospace" }}>
                 ← New Service
               </button>
